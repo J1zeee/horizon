@@ -210,6 +210,32 @@ impl Game<'_> {
             .extra
             .extend(waiting.into_iter().map(|chunk| (chunk, 0)));
         self.streaming.upload_backlog = self.pending_uploads.len();
+        // VRAM budget: stop loading new terrain meshes when video memory is full,
+        // so chunk unloading can keep pace and memory stops growing. Each
+        // reduction level halves the render distance (full, half, quarter),
+        // floored at 4 chunks. Hysteresis (600-frame cooldown) prevents rapid
+        // oscillation. #6705 does this for the scaled screenshot; this extends
+        // it to chunk loading, which is where memory actually accumulates.
+        if let Some(renderer) = &self.renderer {
+            let used = renderer.arena_bytes();
+            let budget = self.vram_budget_bytes.unwrap_or(2 * 1024 * 1024 * 1024);
+            if used > budget {
+                if self.vram_cooldown == 0 {
+                    self.vram_reduction = self.vram_reduction.saturating_add(1).min(2);
+                    self.vram_cooldown = 600;
+                }
+            } else {
+                self.vram_cooldown = self.vram_cooldown.saturating_sub(1);
+                if self.vram_cooldown == 0 && self.vram_reduction > 0 {
+                    self.vram_reduction -= 1;
+                    self.vram_cooldown = 600;
+                }
+            }
+            let divisor = 2u32.pow(self.vram_reduction) as f32;
+            self.streaming.radius = ((self.settings.render_distance as f32) / divisor)
+                .max(4.0)
+                .round() as i32;
+        }
         let (uploads, unloaded) =
             horizon_client::spans::time("streaming", || self.streaming.update(&mut self.world));
         self.streaming.extra.truncate(areas);

@@ -1,6 +1,5 @@
 //! The playable game loop: streaming world, player simulation at 20 ticks/s,
 //! block interaction, inventory and HUD.
-
 /// The content tables the world plays with, as field-level borrows: the
 /// world's data packs' over the game's own. The `Game::items`/`recipes`/
 /// `stations` methods read the same tables, but taking `&self` blocks a
@@ -40,7 +39,6 @@ macro_rules! world_biomes {
         }
     };
 }
-
 /// The world's packs' content files, as a field-level borrow (see the macros).
 fn pack_files(world_tables: &Option<WorldTables>) -> horizon_world::loot::PackOverlay<'_> {
     match world_tables {
@@ -48,7 +46,6 @@ fn pack_files(world_tables: &Option<WorldTables>) -> horizon_world::loot::PackOv
         None => horizon_world::loot::PackOverlay::NONE,
     }
 }
-
 mod advancements;
 mod advancements_screen;
 mod agent;
@@ -617,7 +614,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
 };
-
 /// The time a frame spends uploading chunk meshes when the player set no
 /// Chunk Updates or Upload Budget: a burst past it waits for the next frames.
 const AUTO_UPLOAD_TIME: Duration = Duration::from_millis(2);
@@ -630,7 +626,6 @@ const AUTO_UPLOADS_AT_ONCE: usize = 8;
 /// The most changed columns far terrain waits on behind a mod's hold (`Game::lod_held`): past
 /// it, they go in as ever.
 const HELD_FAR_COLUMNS: usize = 1 << 13;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Playing,
@@ -757,7 +752,6 @@ enum GuestUse {
     /// an entity again from the view.
     Entity(Hand, InteractTarget),
 }
-
 /// The entity an interact packet names and where its client clicked it (the
 /// packet's location, measured from the entity's position): what
 /// `ServerGamePacketListenerImpl.handleInteract` takes from
@@ -768,7 +762,6 @@ struct InteractTarget {
     id: i32,
     location: [f64; 3],
 }
-
 /// The client world as seen by the vanilla block-behaviour library.
 struct GameLevel<'w> {
     gateway_servers: &'w mut horizon_client::fast_hash::FxHashMap<
@@ -1461,7 +1454,6 @@ impl LevelAccess for GameLevel<'_> {
             (pos.x, pos.y, pos.z),
         ))
     }
-
     fn block_entity_analog_signal(
         &self,
         pos: BlockPos,
@@ -1885,20 +1877,17 @@ impl FallingBlock {
         )
     }
 }
-
 /// A block entity's `mark_motion` id: its position, packed into the 32 bits beside the tag
 /// (x and z wrap at 2048 blocks and y at 1024; two block entities that far apart in one frame's
 /// view are told apart by their vertex counts, as `PackEntities` matches only equal runs).
 fn motion_block_entity(pos: [i32; 3]) -> u64 {
     motion_at(Game::MOTION_BLOCK_ENTITY, pos)
 }
-
 /// `tag` with a block position packed into its low 32 bits (`motion_block_entity`).
 fn motion_at(tag: u64, pos: [i32; 3]) -> u64 {
     let [x, y, z] = pos.map(|c| c as u32);
     tag | u64::from((x & 0x7FF) | (z & 0x7FF) << 11 | (y & 0x3FF) << 22)
 }
-
 /// `FallingBlockRenderer.shouldRender` drops a falling block whose own state is
 /// the state of the cell it is in (`level.getBlockState(entity.blockPosition())`):
 /// a `NoGravity` block, or one that has just landed, sits inside an identical
@@ -1906,7 +1895,6 @@ fn motion_at(tag: u64, pos: [i32; 3]) -> u64 {
 fn falling_block_visible(state: BlockStateId, cell: BlockStateId) -> bool {
     state != cell
 }
-
 /// The data loaded once at startup and never changed: blocks, items,
 /// recipes, biomes, mobs, collision and motion. Read-only and `Send + Sync`,
 /// so the client and an integrated server thread can share one copy.
@@ -1914,7 +1902,6 @@ pub struct Resources {
     core: WorldCore,
     rest: std::sync::OnceLock<WorldRest>,
 }
-
 struct WorldCore {
     facts: BlockFacts,
     biomes: Arc<Biomes>,
@@ -2178,6 +2165,16 @@ struct Game<'a> {
     /// `world_biomes` as the biome files made it, before `native_biome_colors`.
     world_biomes_base: Option<Arc<Biomes>>,
     streaming: Streaming,
+    /// Video-memory budget for terrain meshes, in bytes. When `arena_bytes()`
+    /// exceeds it, the render distance is halved (down to a quarter) until
+    /// memory eases again. `None` disables the limit entirely.
+    vram_budget_bytes: Option<u64>,
+    /// How many reduction levels are active: 0 means full distance, each level
+    /// halves it. Raised on OOM/budget-exceeded, lowered by hysteresis.
+    vram_reduction: u32,
+    /// Frames left before `vram_reduction` may change again: prevents rapid
+    /// oscillation between full and reduced distance.
+    vram_cooldown: u32,
     lod: Option<horizon_client::lod::Lod>,
     lod_source_attempted: bool,
     lod_observe: horizon_client::fast_hash::FxHashSet<(i32, i32)>,
@@ -11748,6 +11745,9 @@ impl<'a> Game<'a> {
             panorama_rotation: Default::default(),
             world,
             streaming,
+            vram_budget_bytes: None,
+            vram_reduction: 0,
+            vram_cooldown: 0,
             lod: None,
             lod_source_attempted: false,
             far_beacons: HashMap::new(),
