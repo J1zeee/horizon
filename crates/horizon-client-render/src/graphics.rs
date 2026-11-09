@@ -809,6 +809,14 @@ pub struct Graphics {
     /// The block textures' video memory (their top mip level), in MiB; 0 leaves it to
     /// Horizon (`sprites::DEFAULT_TEXTURE_BUDGET`). Applies when resources next load.
     pub texture_budget_mib: u32,
+    /// Fraction of the GPU's video memory Horizon may use before it starts
+    /// shrinking the render distance (0.0..=1.0). 0 leaves the compile-time
+    /// fallback budget. Applies at the next renderer start.
+    pub oom_memory_budget_fraction: f32,
+    /// Fallback video-memory budget in bytes when the GPU's total memory cannot
+    /// be read (for example on headless or unknown drivers). Applies at the next
+    /// renderer start.
+    pub oom_budget_fallback_bytes: u64,
     pub sky: bool,
     pub fog: bool,
     pub weather: bool,
@@ -909,6 +917,8 @@ impl Default for Graphics {
             chunk_updates: 0,
             upload_budget_kib: 0,
             texture_budget_mib: 0,
+            oom_memory_budget_fraction: 0.65,
+            oom_budget_fallback_bytes: 2 * 1024 * 1024 * 1024,
             sky: true,
             fog: true,
             weather: true,
@@ -1065,6 +1075,12 @@ impl Graphics {
                 "textureBudgetMiB" => {
                     g.texture_budget_mib = number(g.texture_budget_mib).min(16384);
                 }
+                "oomBudgetFraction" => {
+                    g.oom_memory_budget_fraction = number(g.oom_memory_budget_fraction).clamp(0.0, 1.0);
+                }
+                "oomBudgetFallbackBytes" => {
+                    g.oom_budget_fallback_bytes = number(g.oom_budget_fallback_bytes);
+                }
                 "sky" => g.sky = flag(g.sky),
                 "fog" => g.fog = flag(g.fog),
                 "weather" => g.weather = flag(g.weather),
@@ -1134,7 +1150,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscalingSharpness:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiNits:{}\nhdrLighting:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\noomBudgetFraction:{}\noomBudgetFallbackBytes:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscalingSharpness:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiNits:{}\nhdrLighting:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -1154,6 +1170,8 @@ impl Graphics {
             self.chunk_updates,
             self.upload_budget_kib,
             self.texture_budget_mib,
+            self.oom_memory_budget_fraction,
+            self.oom_budget_fallback_bytes,
             bool_text(self.sky),
             bool_text(self.fog),
             bool_text(self.weather),

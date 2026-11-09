@@ -851,6 +851,16 @@ const COMPACT_BUDGET: u64 = 32 << 20;
 const BULK_REMOVAL_KEYS: usize = 256;
 const SHRINK_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 const SHRINK_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Maximum OOM reduction level: 0 = full distance, 1 = half, 2 = quarter, 3 = eighth.
+const OOM_MAX_LEVEL: u32 = 3;
+/// Seconds the renderer waits before changing the OOM level again.
+const OOM_COOLDOWN_SECS: f32 = 5.0;
+/// Maximum consecutive frames skipped for OOM before logging an error.
+const OOM_MAX_SKIPPED_FRAMES: u32 = 10;
+/// Usage ratio above which the render distance is reduced.
+const OOM_USAGE_HIGH: f32 = 0.90;
+/// Usage ratio below which the render distance is restored.
+const OOM_USAGE_LOW: f32 = 0.70;
 /// Not before then may a large translucent page start to shrink.
 #[derive(Default)]
 struct ShrinkGate(Option<Instant>);
@@ -1564,9 +1574,14 @@ pub struct Renderer {
     /// halves its size, down to the window's.
     screenshot_halvings: u32,
     /// Render-distance reduction level from OOM: 0 = full, 1 = half, 2 = quarter.
-    oom_reduction: u32,
-    /// Cooldown frames before `oom_reduction` may change again.
-    oom_cooldown: u32,
+    oom_level: u32,
+    /// Seconds left before `oom_level` may change again; a frame-time cooldown,
+    /// not a frame count (so it is independent of FPS).
+    oom_cooldown_secs: f32,
+    /// Consecutive frames skipped because of OOM; reset to 0 on a drawn frame.
+    oom_skipped_frames: u32,
+    /// Time the last frame started, for computing `dt` between frames.
+    last_frame_instant: Option<Instant>,
     /// Brightness option (lightmap gamma), 0..1.
     pub gamma: f32,
     /// Optional full-light lightmap (Horizon Extras).
@@ -5323,8 +5338,10 @@ impl Renderer {
             screenshot_hdr: None,
             screenshot_quality: 1,
             screenshot_halvings: 0,
-            oom_reduction: 0,
-            oom_cooldown: 0,
+            oom_level: 0,
+            oom_cooldown_secs: 0.0,
+            oom_skipped_frames: 0,
+            last_frame_instant: None,
             gamma: 0.5,
             improved_transparency: false,
             oit: None,
@@ -8075,25 +8092,81 @@ impl Renderer {
     }
     /// Effective detail distance after OOM reduction: halves per level, min 4 chunks.
     fn effective_detail_distance(&self, detail_distance: f32) -> f32 {
-        Self::effective_detail_distance_oom(self.oom_reduction, detail_distance)
+        Self::effective_detail_distance_oom(self.oom_level, detail_distance)
     }
-    /// Hysteresis: tick cooldown down, drop one reduction level at zero.
-    fn oom_hysteresis(&mut self) {
-        let (r, c) = Self::oom_hysteresis_step(self.oom_reduction, self.oom_cooldown);
-        self.oom_reduction = r;
-        self.oom_cooldown = c;
+    /// Hysteresis with two usage thresholds: raise the level when usage is above
+    /// `OOM_USAGE_HIGH`, lower it when below `OOM_USAGE_LOW`. Between the
+    /// thresholds nothing changes. `dt` is seconds since the last call.
+    fn oom_hysteresis(&mut self, usage_ratio: f32, dt: f32) {
+        let (level, cooldown) = Self::oom_hysteresis_step(
+            self.oom_level,
+            self.oom_cooldown_secs,
+            usage_ratio,
+            dt,
+        );
+        self.oom_level = level;
+        self.oom_cooldown_secs = cooldown;
     }
-    fn effective_detail_distance_oom(oom_reduction: u32, detail_distance: f32) -> f32 {
-        (detail_distance / 2u32.pow(oom_reduction) as f32).max(4.0 * 16.0)
+    /// `detail_distance` in blocks, already divided by `2^level`, floored at 4 chunks.
+    fn effective_detail_distance_oom(oom_level: u32, detail_distance: f32) -> f32 {
+        (detail_distance / 2u32.pow(oom_level) as f32).max(4.0 * 16.0)
     }
-    fn oom_hysteresis_step(oom_reduction: u32, oom_cooldown: u32) -> (u32, u32) {
-        if oom_cooldown > 0 {
-            (oom_reduction, oom_cooldown - 1)
-        } else if oom_reduction > 0 {
-            (oom_reduction - 1, 600)
-        } else {
-            (0, 0)
+    /// Pure hysteresis step: cooldown ticks down in seconds; above the high
+    /// threshold the level rises, below the low threshold it falls.
+    #[cfg(test)]
+    fn oom_hysteresis_step(
+        oom_level: u32,
+        oom_cooldown_secs: f32,
+        usage_ratio: f32,
+        dt: f32,
+    ) -> (u32, f32) {
+        if oom_cooldown_secs > 0.0 {
+            return (oom_level, (oom_cooldown_secs - dt).max(0.0));
         }
+        if usage_ratio > OOM_USAGE_HIGH && oom_level < OOM_MAX_LEVEL {
+            return (oom_level + 1, OOM_COOLDOWN_SECS);
+        }
+        if usage_ratio < OOM_USAGE_LOW && oom_level > 0 {
+            return (oom_level - 1, OOM_COOLDOWN_SECS);
+        }
+        (oom_level, 0.0)
+    }
+    /// Seconds since the last frame started; 0.0 on the very first frame.
+    fn frame_dt(&mut self) -> f32 {
+        let now = Instant::now();
+        let dt = self
+            .last_frame_instant
+            .map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+        self.last_frame_instant = Some(now);
+        dt
+    }
+    /// Bytes of GPU memory used by the renderer's main allocations: the terrain
+    /// and translucent arenas (pages and what resident sections occupy).
+    /// This is only part of video memory; textures, frame targets and upload
+    /// buffers are not yet included here (see `gpu_census` for a fuller list).
+    fn gpu_used_bytes(&self) -> u64 {
+        self.arena_bytes()
+    }
+    /// The video-memory budget in bytes: `oom_memory_budget_fraction` of the
+    /// GPU's total memory when that can be read, otherwise
+    /// `oom_budget_fallback_bytes`. A fraction of 0 leaves the fallback.
+    fn gpu_budget_bytes(&self) -> u64 {
+        let fraction = self.horizon.oom_memory_budget_fraction;
+        if fraction <= 0.0 {
+            return self.horizon.oom_budget_fallback_bytes;
+        }
+        // wgpu's public API does not expose total video memory; the fallback
+        // budget is used until a platform-specific query is added.
+        let fallback = self.horizon.oom_budget_fallback_bytes;
+        (fallback as f64 * fraction as f64) as u64
+    }
+    /// `gpu_used_bytes / gpu_budget_bytes`: 0.0 when the budget is unknown.
+    fn gpu_memory_usage_ratio(&self) -> f32 {
+        let budget = self.gpu_budget_bytes();
+        if budget == 0 {
+            return 0.0;
+        }
+        self.gpu_used_bytes() as f32 / budget as f32
     }
 
     /// `checks`: the error scopes of a scaled screenshot's frame, checked before its PNG is written.
@@ -12035,19 +12108,35 @@ impl Renderer {
         if let Some(ref e) = failed
             && readback.is_none()
         {
-            // Only escalate once per cooldown so a run of consecutive OOM
-            // frames does not jump straight to the maximum reduction.
-            if self.oom_cooldown == 0 {
-                self.oom_reduction = self.oom_reduction.saturating_add(1).min(3);
-                self.oom_cooldown = 600;
+            // Escalate once per cooldown so a run of consecutive OOM frames
+            // does not jump straight to the maximum reduction.
+            if self.oom_cooldown_secs == 0.0 {
+                self.oom_level = self.oom_level.saturating_add(1).min(OOM_MAX_LEVEL);
+                self.oom_cooldown_secs = OOM_COOLDOWN_SECS;
+                // Drop anything cheap to reload: cached meshes and staged uploads.
+                self.arena.trim();
+                if let Some(arena) = &mut self.translucent_arena {
+                    arena.trim();
+                }
+                self.graveyard.clear();
             }
             let chunks = self.effective_detail_distance(frame.detail_distance) as i32 / 16;
+            self.oom_skipped_frames = self.oom_skipped_frames.saturating_add(1);
             log::warn!(
-                "Horizon renderer: out of video memory ({e}); reducing render distance to {chunks} chunks, skipping this frame",
+                "Horizon renderer: out of video memory ({e}); reducing render distance to {chunks} chunks, skipping this frame (skipped {})",
+                self.oom_skipped_frames,
             );
+            if self.oom_skipped_frames >= OOM_MAX_SKIPPED_FRAMES {
+                log::error!(
+                    "Horizon renderer: {} consecutive frames out of video memory; render distance is at {chunks} chunks, restart the renderer to recover",
+                    self.oom_skipped_frames,
+                );
+            }
             return Ok(false);
         }
-        self.oom_hysteresis();
+        self.oom_skipped_frames = 0;
+        let usage_ratio = self.gpu_memory_usage_ratio();
+        self.oom_hysteresis(usage_ratio, self.frame_dt());
         if let Some((request, buffer)) = readback {
             // Out of memory on the way: the PNG would be black; taken again at half the size.
             if let Some(e) = failed {
@@ -15701,6 +15790,94 @@ mod shadow_caster_tests {
         assert!(!kept(50.0, 339.0, -20.0, [3.0, 4.0, -1.0]));
         assert!(!kept(50.0, 0.0, 0.0, [-2.0, 3.0, 0.0]));
     }
+    /// Each OOM reduction level halves the detail distance, floored at 4 chunks.
+    #[test]
+    fn effective_detail_distance_oom_halves_each_level() {
+        let full = 128.0 * 16.0; // 128 chunks in blocks
+        assert_eq!(Self::effective_detail_distance_oom(0, full), full);
+        assert_eq!(Self::effective_detail_distance_oom(1, full), full / 2.0);
+        assert_eq!(Self::effective_detail_distance_oom(2, full), full / 4.0);
+        assert_eq!(Self::effective_detail_distance_oom(3, full), full / 8.0);
+    }
+    /// The floor is 4 chunks (64 blocks), never below.
+    #[test]
+    fn effective_detail_distance_oom_floors_at_four_chunks() {
+        let tiny = 2.0 * 16.0; // 2 chunks in blocks
+        assert_eq!(Self::effective_detail_distance_oom(1, tiny), 4.0 * 16.0);
+        assert_eq!(Self::effective_detail_distance_oom(3, tiny), 4.0 * 16.0);
+    }
+    /// Above the high threshold (0.90) the level rises, below the low (0.70) it falls.
+    #[test]
+    fn oom_hysteresis_step_above_high_threshold_raises_level() {
+        assert_eq!(
+            Self::oom_hysteresis_step(0, 0.0, 0.95, 0.0),
+            (1, OOM_COOLDOWN_SECS)
+        );
+        assert_eq!(
+            Self::oom_hysteresis_step(1, 0.0, 0.95, 0.0),
+            (2, OOM_COOLDOWN_SECS)
+        );
+        assert_eq!(
+            Self::oom_hysteresis_step(3, 0.0, 0.99, 0.0),
+            (3, OOM_COOLDOWN_SECS)
+        );
+    }
+    /// Below the low threshold (0.70) the level falls (distance is restored).
+    #[test]
+    fn oom_hysteresis_step_below_low_threshold_restores() {
+        assert_eq!(
+            Self::oom_hysteresis_step(3, 0.0, 0.50, 0.0),
+            (2, OOM_COOLDOWN_SECS)
+        );
+        assert_eq!(
+            Self::oom_hysteresis_step(1, 0.0, 0.30, 0.0),
+            (0, OOM_COOLDOWN_SECS)
+        );
+        assert_eq!(
+            Self::oom_hysteresis_step(0, 0.0, 0.10, 0.0),
+            (0, 0.0)
+        );
+    }
+    /// Between thresholds nothing changes.
+    #[test]
+    fn oom_hysteresis_step_between_thresholds_no_change() {
+        assert_eq!(Self::oom_hysteresis_step(2, 0.0, 0.80, 0.0), (2, 0.0));
+        assert_eq!(Self::oom_hysteresis_step(0, 0.0, 0.80, 0.0), (0, 0.0));
+    }
+    /// Cooldown ticks down in seconds; no level change while it runs.
+    #[test]
+    fn oom_hysteresis_step_cooldown_ticks_down() {
+        let (level, cooldown) = Self::oom_hysteresis_step(2, 1.0, 0.95, 0.5);
+        assert_eq!(level, 2);
+        assert!((cooldown - 0.5).abs() < f32::EPSILON);
+        let (level, cooldown) = Self::oom_hysteresis_step(2, 0.3, 0.95, 1.0);
+        assert_eq!(level, 2);
+        assert!((cooldown - 0.0).abs() < f32::EPSILON);
+    }
+    /// Cooldown blocks both raising and lowering.
+    #[test]
+    fn oom_hysteresis_step_cooldown_blocks_change() {
+        assert_eq!(
+            Self::oom_hysteresis_step(0, 2.0, 0.99, 0.5),
+            (0, 1.5)
+        );
+        assert_eq!(
+            Self::oom_hysteresis_step(3, 2.0, 0.10, 0.5),
+            (3, 1.5)
+        );
+    }
+    /// After cooldown expires, a single step changes at most one level.
+    #[test]
+    fn oom_hysteresis_step_one_level_per_step() {
+        assert_eq!(
+            Self::oom_hysteresis_step(0, 0.0, 0.99, 0.0),
+            (1, OOM_COOLDOWN_SECS)
+        );
+        assert_eq!(
+            Self::oom_hysteresis_step(3, 0.0, 0.01, 0.0),
+            (2, OOM_COOLDOWN_SECS)
+        );
+    }
 }
 /// A `shaders/` pack building on its own thread (`Renderer::load_shader_pack`): the dimension it
 /// is for, the thread (a panic in it contained), and what the game named it with and when.
@@ -15724,5 +15901,3 @@ impl Drop for CancelOnDrop {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
-#[cfg(test)]
-mod oom;
